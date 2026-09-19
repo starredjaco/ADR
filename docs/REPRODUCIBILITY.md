@@ -125,6 +125,10 @@ Without `--results-dir`, `main_detector.py` uses the latest `adr_bench_*` direct
 
 The summary reports **tasks scored N/M**; dropped tasks (missing conversation or errors) are excluded from metrics and flagged with a warning. Each `*_baseline_analysis.json` also includes a `run_stats` object (`total_tasks`, `scored`, `dropped`).
 
+Each analysis JSON also includes an additive `run_manifest` for **run provenance**. It records the source commit and dirty state when available, resolved detector concurrency, sorted selected task IDs, and SHA-256 digests covering the selected conversation inputs and their effective labels. AgentDojo runs also hash that run's `ground_truth.json`. Fixed detector artifacts (`config_detector.yaml`, `uv.lock`, and ADR-Bench `tasks.json`) are hashed when available. Collection is best-effort and nonfatal; unavailable values are `null`. The manifest omits paths, arbitrary directory names, host identifiers, environment values, prompts, and file contents. It helps compare runs and investigate regressions, but does not guarantee reproducibility.
+
+Input hashes describe the bytes actually read, even if files are edited or removed during analysis. Configuration and ADR-Bench task definitions are loaded from the current working directory, and the same task snapshot supplies both labels and MCP definitions. Git and lockfile metadata are captured before analysis. Conversation hashes are captured when each selected file is read; unreadable files are listed in `missing_task_ids`. This is not an atomic snapshot of the entire directory: keep benchmark inputs unchanged during a run when comparing results.
+
 Outputs are written into the benchmark directory:
 
 ```

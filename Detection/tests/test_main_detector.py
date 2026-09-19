@@ -98,6 +98,10 @@ class TestProcessBenchmarkResults:
         assert result["run_stats"] == {"total_tasks": 1, "scored": 1, "dropped": 0}
         saved = json.loads(json.dumps(result))
         assert saved["run_stats"] == {"total_tasks": 1, "scored": 1, "dropped": 0}
+        assert saved["run_manifest"]["kind"] == "run_provenance"
+        assert saved["run_manifest"]["benchmark_type"] == "adr_bench"
+        assert saved["run_manifest"]["selected_task_ids"] == [1]
+        assert {"detector_info", "analyses", "metrics", "run_stats", "analysis_timestamp"} <= set(saved)
 
 
 class TestValidateBenchmarkResultsDir:

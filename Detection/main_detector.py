@@ -12,7 +12,7 @@ import json
 import sys
 import traceback
 from pathlib import Path
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional
 from datetime import datetime
 import logging
 
@@ -26,6 +26,7 @@ logger = logging.getLogger(__name__)
 # Import the baseline detectors
 from guardrail.llamafirewall_agent.llamafirewall_baseline import LlamaFirewallBaseline
 from guardrail.adr_agent.adr_baseline import ADRBaseline
+from run_manifest import collect_run_manifest, collect_source_metadata, read_text_with_sha256
 
 
 class BenchmarkAnalyzer:
@@ -33,7 +34,7 @@ class BenchmarkAnalyzer:
     Analyzer for processing ADR benchmark results and generating metrics.
     """
 
-    def __init__(self, detector):
+    def __init__(self, detector, *, config_sha256=None, source_metadata=None):
         """
         Initialize with a baseline detector.
 
@@ -41,6 +42,11 @@ class BenchmarkAnalyzer:
             detector: Any detector implementing BaseDetector interface
         """
         self.detector = detector
+        self._config_sha256 = config_sha256
+        self._source_metadata = source_metadata
+        self._conversation_hashes: Dict[str, Optional[str]] = {}
+        self._artifact_hashes: Dict[str, Optional[str]] = {}
+        self._loaded_task_definitions = None
 
     def process_benchmark_results(self, results_dir_path: str, task_filter: List[int] = None, max_concurrent: int = 10,
                                   benchmark_type: str = "adr_bench") -> Dict[str, Any]:
@@ -69,6 +75,15 @@ class BenchmarkAnalyzer:
 
         validate_benchmark_results_dir(results_path, benchmark_type)
 
+        # Keep one input snapshot per run, including when this analyzer is reused.
+        source_metadata = self._source_metadata or collect_source_metadata(Path(__file__).parent)
+        self._conversation_hashes = {}
+        self._artifact_hashes = {
+            'config_detector': self._config_sha256,
+            'uv_lock': source_metadata['uv_lock'],
+        }
+        self._loaded_task_definitions = None
+
         print(f"📁 Found {len(task_dirs)} task directories to analyze")
 
         inferred_type = "agentdojo" if "agentdojo" in results_path.name else "adr_bench"
@@ -78,28 +93,46 @@ class BenchmarkAnalyzer:
 
         # Run analysis
         analyses, run_stats = self._analyze_tasks_efficiently(
-            sorted(task_dirs), task_filter, max_concurrent, benchmark_type, ground_truth
+            sorted(task_dirs), task_filter, max_concurrent, benchmark_type, ground_truth,
+            task_definitions=self._loaded_task_definitions,
         )
 
         # Calculate metrics
         metrics = self._calculate_metrics(analyses, ground_truth)
+
+        selected_task_dirs = task_dirs
+        if task_filter:
+            selected_names = {f"task_{task_id:03d}" for task_id in task_filter}
+            selected_task_dirs = [task_dir for task_dir in task_dirs if task_dir.name in selected_names]
+        run_manifest = collect_run_manifest(
+            benchmark_type=benchmark_type,
+            task_dirs=selected_task_dirs,
+            effective_labels=ground_truth,
+            resolved_concurrency=max_concurrent,
+            conversation_hashes=self._conversation_hashes,
+            artifact_hashes=self._artifact_hashes,
+            source=source_metadata['source'],
+        )
 
         return {
             'detector_info': self.detector.get_info(),
             'analyses': analyses,
             'metrics': metrics,
             'run_stats': run_stats,
-            'analysis_timestamp': datetime.now().isoformat()
+            'analysis_timestamp': datetime.now().isoformat(),
+            'run_manifest': run_manifest
         }
 
     def _analyze_tasks_efficiently(self, task_dirs: List[Path], task_filter: List[int] = None, max_concurrent: int = 10,
-                                  benchmark_type: str = "adr_bench", ground_truth_dict: Dict[str, bool] = None) -> tuple[List[Dict[str, Any]], Dict[str, int]]:
+                                  benchmark_type: str = "adr_bench", ground_truth_dict: Dict[str, bool] = None,
+                                  task_definitions: Dict[str, Any] = None) -> tuple[List[Dict[str, Any]], Dict[str, int]]:
         """Analyze tasks using the detector in an optimized manner."""
         # Run the async analysis in a new event loop
-        return asyncio.run(self._analyze_tasks_async(task_dirs, task_filter, max_concurrent, benchmark_type, ground_truth_dict))
+        return asyncio.run(self._analyze_tasks_async(task_dirs, task_filter, max_concurrent, benchmark_type, ground_truth_dict, task_definitions))
 
     async def _analyze_tasks_async(self, task_dirs: List[Path], task_filter: List[int] = None, max_concurrent: int = 10,
-                                  benchmark_type: str = "adr_bench", ground_truth_dict: Dict[str, bool] = None) -> tuple[List[Dict[str, Any]], Dict[str, int]]:
+                                  benchmark_type: str = "adr_bench", ground_truth_dict: Dict[str, bool] = None,
+                                  task_definitions: Dict[str, Any] = None) -> tuple[List[Dict[str, Any]], Dict[str, int]]:
         """Analyze tasks using the detector with parallel processing."""
         analyses = []
 
@@ -112,16 +145,18 @@ class BenchmarkAnalyzer:
 
         total_tasks = len(task_dirs)
 
-        # Load task definitions
-        task_definitions = {}
-        if benchmark_type == "adr_bench":
-            # Load tasks.json for ADR-Bench MCP server information
+        # Reuse the same task snapshot as the labels. Direct helper callers can
+        # still load definitions here when no snapshot was supplied.
+        if task_definitions is None:
+            task_definitions = {}
             tasks_file = Path("tasks.json")
-            if tasks_file.exists():
-                with open(tasks_file, 'r') as f:
-                    tasks_data = json.load(f)
-                    for task in tasks_data.get("tasks", []):
-                        task_definitions[f"task_{task['task_id']:03d}"] = task
+            if benchmark_type == "adr_bench" and tasks_file.exists():
+                text, digest = read_text_with_sha256(tasks_file)
+                self._artifact_hashes['tasks'] = digest
+                tasks_data = json.loads(text)
+                del text
+                for task in tasks_data.get("tasks", []):
+                    task_definitions[f"task_{task['task_id']:03d}"] = task
 
         # Simple semaphore for concurrency control
         semaphore = asyncio.Semaphore(max_concurrent)
@@ -208,8 +243,10 @@ class BenchmarkAnalyzer:
                 return None
 
             # Load the structured conversation file
-            with open(conversation_file, 'r', encoding='utf-8') as f:
-                conversation_data = json.load(f)
+            text, digest = read_text_with_sha256(conversation_file, encoding='utf-8')
+            self._conversation_hashes[task_id] = digest
+            conversation_data = json.loads(text)
+            del text
 
             # Convert to our chat log format
             messages = self._convert_conversation_to_messages(conversation_data)
@@ -304,14 +341,20 @@ class BenchmarkAnalyzer:
                 return {}
 
             try:
-                with open(tasks_file, 'r', encoding='utf-8') as f:
-                    tasks_data = json.load(f)
+                text, digest = read_text_with_sha256(tasks_file, encoding='utf-8')
+                self._artifact_hashes['tasks'] = digest
+                tasks_data = json.loads(text)
+                del text
 
                 ground_truth = {}
+                task_definitions = {}
                 # Handle the current format where tasks is a list
                 for task in tasks_data['tasks']:
                     task_id = f"task_{task['task_id']:03d}"
                     ground_truth[task_id] = task.get('ground_truth', 'benign') == 'malicious'
+                    task_definitions[task_id] = task
+
+                self._loaded_task_definitions = task_definitions
 
                 print(f"📋 Loaded ADR-Bench ground truth for {len(ground_truth)} tasks")
                 return ground_truth
@@ -326,8 +369,10 @@ class BenchmarkAnalyzer:
             if not ground_truth_file.exists():
                 raise FileNotFoundError(f"AgentDojo ground truth file not found: {ground_truth_file.absolute()}")
 
-            with open(ground_truth_file, 'r') as f:
-                agentdojo_ground_truth = json.load(f)
+            text, digest = read_text_with_sha256(ground_truth_file)
+            self._artifact_hashes['agentdojo_ground_truth'] = digest
+            agentdojo_ground_truth = json.loads(text)
+            del text
 
             ground_truth = {}
             for task_key, task_data in agentdojo_ground_truth.items():
@@ -732,11 +777,14 @@ def main():
     print("=" * 50)
 
     # Load detector configuration upfront
+    source_metadata = collect_source_metadata(Path(__file__).parent)
     config_file = Path("config_detector.yaml")
     config_data = {}
+    config_sha256 = None
     if config_file.exists():
-        with open(config_file, 'r') as f:
-            config_data = yaml.safe_load(f) or {}
+        text, config_sha256 = read_text_with_sha256(config_file)
+        config_data = yaml.safe_load(text) or {}
+        del text
         print(f"📋 Loaded configuration from {config_file}")
     else:
         print(f"⚠️  Configuration file {config_file} not found, using defaults")
@@ -814,7 +862,9 @@ def main():
         if args.detector != "adr":  # ADR already printed detailed info above
             print(f"✅ {args.detector} ready")
 
-    analyzer = BenchmarkAnalyzer(detector)
+    analyzer = BenchmarkAnalyzer(
+        detector, config_sha256=config_sha256, source_metadata=source_metadata
+    )
 
     # Process task filtering arguments
     task_filter = None

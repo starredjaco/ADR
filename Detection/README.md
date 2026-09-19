@@ -291,6 +291,10 @@ benchmark/adr_bench_YYYYMMDD_HHMMSS/
 └── summary.json                       # Original benchmark results
 ```
 
+Each detector result includes an additive `run_manifest` with privacy-safe run provenance: source revision when available, resolved concurrency, sorted selected task IDs, and SHA-256 digests of selected conversations, effective labels, and fixed detector inputs. AgentDojo includes a digest of `ground_truth.json`. Missing provenance is recorded as `null` and never fails detection. Paths, directory names, host identifiers, environment values, prompts, and file contents are not stored.
+
+Input digests are captured from the same bytes read by the detector, not by rereading files after analysis. The CLI uses `config_detector.yaml` and ADR-Bench `tasks.json` from the current working directory; task labels and MCP definitions share one snapshot. Source revision and `uv.lock` are captured before analysis. Programmatic callers that supply an already-configured detector without its configuration digest get `null` for that artifact.
+
 **Each detector file contains**:
 
 - `detector_info`: Configuration and model information
